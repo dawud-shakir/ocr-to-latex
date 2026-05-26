@@ -171,10 +171,30 @@ class BaseSystem(pl.LightningModule, ABC):
     def on_validation_epoch_end(self) -> None:
         acc, ned, loss = self._aggregate_results(self.outputs)
         self.outputs.clear()
-        self.log('val_accuracy', 100 * acc, sync_dist=True)
-        self.log('val_NED', 100 * ned, sync_dist=True)
+
+        val_accuracy = 100 * acc
+        val_ned = 100 * ned
+
+        self.log('val_accuracy', val_accuracy, sync_dist=True)
+        self.log('val_NED', val_ned, sync_dist=True)
         self.log('val_loss', loss, sync_dist=True)
         self.log('hp_metric', acc, sync_dist=True)
+
+        # Do not print during Lightning's pre-training sanity validation.
+        if getattr(self.trainer, "sanity_checking", False):
+            return
+
+        loss_value = loss.detach().item() if torch.is_tensor(loss) else float(loss)
+
+        # Avoid duplicate prints if using multiple devices later.
+        if self.trainer.is_global_zero:
+            print(
+                f"\nEpoch {self.current_epoch}: "
+                f"val_accuracy={val_accuracy:.2f}% | "
+                f"val_NED={val_ned:.2f}% | "
+                f"val_loss={loss_value:.4f}",
+                flush=True,
+            )
 
     def test_step(self, batch, batch_idx) -> Optional[STEP_OUTPUT]:
         return self._eval_step(batch, False)

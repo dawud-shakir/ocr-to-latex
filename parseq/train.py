@@ -78,18 +78,53 @@ def main(config: DictConfig):
     # If specified, use pretrained weights to initialize the model
     if config.pretrained is not None:
         m = model.model if config.model._target_.endswith('PARSeq') else model
-        m.load_state_dict(get_pretrained_weights(config.pretrained))
+
+        # The pretrained PARSeq checkpoint was trained with its original charset.
+        # For handwriting fine-tuning, we may use a custom charset containing spaces,
+        # math symbols, Greek letters, etc. Changing the charset changes the shape of
+        # charset-dependent layers such as:
+        #
+        #   - head.weight / head.bias
+        #   - text_embed.embedding.weight
+        #
+        # A strict load_state_dict() would fail on those shape mismatches. Instead,
+        # load only the pretrained tensors whose names and shapes still match the
+        # current model. This keeps the useful pretrained encoder/decoder weights,
+        # while leaving the resized charset-specific layers randomly initialized so
+        # they can learn the custom handwriting symbols during fine-tuning. 
+        # (dawud, 2026-05-17)
+
+        # m.load_state_dict(get_pretrained_weights(config.pretrained))
+        pretrained = get_pretrained_weights(config.pretrained)
+        current = m.state_dict()
+
+        compatible = {
+            k: v for k, v in pretrained.items()
+            if k in current and v.shape == current[k].shape
+        }
+
+        skipped = [
+            k for k, v in pretrained.items()
+            if k in current and v.shape != current[k].shape
+        ]
+
+        print("Skipped pretrained layers due to shape mismatch:", skipped)
+
+        m.load_state_dict(compatible, strict=False)
+
     print(summarize(model, max_depth=2))
 
     datamodule: SceneTextDataModule = hydra.utils.instantiate(config.data)
 
+    # Select checkpoints by val_NED instead of val_accuracy. (dawud 2026-05-19)
     checkpoint = ModelCheckpoint(
-        monitor='val_accuracy',
+        monitor='val_NED',
         mode='max',
         save_top_k=3,
         save_last=True,
         filename='{epoch}-{step}-{val_accuracy:.4f}-{val_NED:.4f}',
     )
+
     swa_epoch_start = 0.75
     swa_lr = config.model.lr * get_swa_lr_factor(config.model.warmup_pct, swa_epoch_start)
     swa = StochasticWeightAveraging(swa_lr, swa_epoch_start)
