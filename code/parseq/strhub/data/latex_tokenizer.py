@@ -2,9 +2,9 @@
 # Hybrid LaTeX tokenizer extension for PARSeq fine-tuning.
 #
 # This file intentionally leaves the original character tokenizer untouched.
-# It adds a tokenizer that can treat selected LaTeX commands (for example
-# \frac or \alpha) as single sequence tokens while still falling back to
-# ordinary character tokens for everything else.
+# It adds a tokenizer that can treat selected LaTeX commands/structures
+# (for example \frac, \alpha, _{, or ^{) as single sequence tokens while
+# still falling back to ordinary character tokens for everything else.
 
 from __future__ import annotations
 
@@ -27,9 +27,10 @@ class HybridLatexTokenizer(BaseTokenizer):
     This matters because the PARSeq output head predicts every token except
     BOS and PAD. EOS must therefore remain inside the output-head range.
 
-    `latex_tokens` should contain multi-character LaTeX commands such as
-    r"\\frac", r"\\sqrt", r"\\alpha", etc.  Any text not matched by those
-    commands is encoded character-by-character using `char_tokens`.
+    `latex_tokens` should contain multi-character LaTeX commands/structures
+    such as r"\\frac", r"\\sqrt", r"\\alpha", r"_{", r"^{", etc.
+    Any text not matched by those tokens is encoded character-by-character
+    using `char_tokens`.
     """
 
     BOS = '[B]'
@@ -53,8 +54,10 @@ class HybridLatexTokenizer(BaseTokenizer):
             seen_latex.add(tok)
             cleaned_latex_tokens.append(tok)
 
-        # Longest first prevents partial-command matches when one command is a
-        # prefix of another, e.g. r"\\right" before r"\\rightarrow".
+        # Longest first prevents partial matches when one token is a prefix
+        # of another, e.g. r"\\right" before r"\\rightarrow". It also lets
+        # structural tokens such as r"_{" and r"^{" be recognized before their
+        # individual fallback characters.
         self.latex_tokens = tuple(sorted(cleaned_latex_tokens, key=len, reverse=True))
 
         # Preserve charset order while removing duplicates.
@@ -69,7 +72,11 @@ class HybridLatexTokenizer(BaseTokenizer):
         self.eos_id, self.bos_id, self.pad_id = [self._stoi[s] for s in specials_first + specials_last]
 
     def tokenize(self, label: str) -> list[str]:
-        """Tokenize one label using longest-match LaTeX command matching.
+        """Tokenize one label using longest-match hybrid-token matching.
+
+        Matching is intentionally *not* limited to backslash-starting commands.
+        This lets structural tokens like r"_{" and r"^{" work even when "_"
+        and "^" are not standalone fallback characters in `char_tokens`.
 
         Unknown LaTeX commands are not fatal as long as their characters are in
         `char_tokens`; for example, if r"\\operatorname" is not listed as one token,
@@ -80,11 +87,13 @@ class HybridLatexTokenizer(BaseTokenizer):
         while i < len(label):
             matched = None
 
-            if label[i] == '\\':
-                for tok in self.latex_tokens:
-                    if label.startswith(tok, i):
-                        matched = tok
-                        break
+            # Longest-match over every hybrid token, not just tokens beginning
+            # with backslash. This supports both command tokens (\frac) and
+            # structural tokens (_{, ^{).
+            for tok in self.latex_tokens:
+                if label.startswith(tok, i):
+                    matched = tok
+                    break
 
             if matched is not None:
                 tokens.append(matched)
@@ -95,7 +104,8 @@ class HybridLatexTokenizer(BaseTokenizer):
             if ch not in self._stoi:
                 raise KeyError(
                     f"Unsupported label character {ch!r} at index {i} in {label!r}. "
-                    "Add it to charset_train or convert it before training."
+                    "Add it to charset_train, add a matching latex_tokens entry, "
+                    "or convert it before training."
                 )
             tokens.append(ch)
             i += 1

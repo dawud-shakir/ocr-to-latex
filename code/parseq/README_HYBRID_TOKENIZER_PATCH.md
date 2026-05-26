@@ -61,3 +61,17 @@ becomes:
 ## Pretrained loading
 
 Your current `train.py` already loads only shape-compatible pretrained tensors. That is important because hybrid tokenization changes the output vocabulary size, so token-specific layers such as `head` and `text_embed` will be reinitialized while compatible encoder/decoder weights are reused.
+
+## 2026-05-25 tokenizer update
+
+`HybridLatexTokenizer.tokenize()` now performs longest-match over every entry in
+`latex_tokens`, not only backslash-starting commands. This allows structural
+hybrid tokens such as `_{` and `^{` to work even when `_` and `^` are not present
+as standalone characters in `charset_train`.
+
+Example with `_` and `^` intentionally absent from `charset_train`:
+
+```text
+x_{2}        -> ['x', '_{', '2', '}']
+y^{(0 + 0)}  -> ['y', '^{', '(', '0', ' ', '+', ' ', '0', ')', '}']
+```

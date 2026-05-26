@@ -6,7 +6,7 @@
 #   [\frac] [{] [x] [+] [1] [}] [{] [y] [}]
 model:
   tokenizer_type: latex_hybrid
-  charset_train: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ " # includes a whitespace
+  charset_train: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ "
   latex_tokens:
     - "\\frac"
     - "\\sqrt"
