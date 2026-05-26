@@ -1,0 +1,43 @@
+# @package _global_
+# Character fallback + selected multi-character LaTeX command tokens.
+#
+# `max_label_length` is now measured in hybrid tokens when tokenizer_type is
+# latex_hybrid. For example, \frac{x+1}{y} becomes:
+#   [\frac] [{] [x] [+] [1] [}] [{] [y] [}]
+model:
+  tokenizer_type: latex_hybrid
+  charset_train: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ "
+  latex_tokens:
+    - "\\frac"
+    - "\\sqrt"
+    - "\\sum"
+    - "\\int"
+    - "\\lim"
+    - "\\max"
+    - "\\min"
+    - "\\sin"
+    - "\\cos"
+    - "\\tan"
+    - "\\log"
+    - "\\ln"
+    - "\\alpha"
+    - "\\beta"
+    - "\\gamma"
+    - "\\delta"
+    - "\\epsilon"
+    - "\\theta"
+    - "\\lambda"
+    - "\\mu"
+    - "\\pi"
+    - "\\rho"
+    - "\\sigma"
+    - "\\phi"
+    - "\\omega"
+    - "\\infty"
+    - "\\leq"
+    - "\\geq"
+    - "\\neq"
+    - "\\cdot"
+    - "\\times"
+    - "\\left"
+    - "\\right"

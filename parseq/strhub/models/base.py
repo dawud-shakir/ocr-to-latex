@@ -16,7 +16,7 @@
 import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Sequence
 
 from nltk import edit_distance
 
@@ -30,6 +30,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.utilities.types import STEP_OUTPUT
 from timm.optim import create_optimizer_v2
 
+from strhub.data.latex_tokenizer import HybridLatexTokenizer
 from strhub.data.utils import BaseTokenizer, CharsetAdapter, CTCTokenizer, Tokenizer
 
 
@@ -203,9 +204,26 @@ class BaseSystem(pl.LightningModule, ABC):
 class CrossEntropySystem(BaseSystem):
 
     def __init__(
-        self, charset_train: str, charset_test: str, batch_size: int, lr: float, warmup_pct: float, weight_decay: float
+        self,
+        charset_train: str,
+        charset_test: str,
+        batch_size: int,
+        lr: float,
+        warmup_pct: float,
+        weight_decay: float,
+        tokenizer_type: str = 'char',
+        latex_tokens: Optional[Sequence[str]] = None,
     ) -> None:
-        tokenizer = Tokenizer(charset_train)
+        if tokenizer_type == 'char':
+            tokenizer = Tokenizer(charset_train)
+        elif tokenizer_type == 'latex_hybrid':
+            tokenizer = HybridLatexTokenizer(charset_train, latex_tokens)
+        else:
+            raise ValueError(
+                f"Unknown tokenizer_type={tokenizer_type!r}. "
+                "Use 'char' or 'latex_hybrid'."
+            )
+
         super().__init__(tokenizer, charset_test, batch_size, lr, warmup_pct, weight_decay)
         self.bos_id = tokenizer.bos_id
         self.eos_id = tokenizer.eos_id

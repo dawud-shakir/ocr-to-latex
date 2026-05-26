@@ -56,9 +56,20 @@ class PARSeq(CrossEntropySystem):
         decode_ar: bool,
         refine_iters: int,
         dropout: float,
+        tokenizer_type: str = 'char',
+        latex_tokens: Optional[Sequence[str]] = None,
         **kwargs: Any,
     ) -> None:
-        super().__init__(charset_train, charset_test, batch_size, lr, warmup_pct, weight_decay)
+        super().__init__(
+            charset_train,
+            charset_test,
+            batch_size,
+            lr,
+            warmup_pct,
+            weight_decay,
+            tokenizer_type=tokenizer_type,
+            latex_tokens=latex_tokens,
+        )
         self.save_hyperparameters()
 
         self.model = Model(
@@ -92,28 +103,28 @@ class PARSeq(CrossEntropySystem):
         This works because the same attention mask can be used for the shorter sequences
         because of the padding mask.
         """
-        # We don't permute the position of BOS, we permute EOS separately
-        max_num_chars = tgt.shape[1] - 2
-        # Special handling for 1-character sequences
-        if max_num_chars == 1:
+        # We do not permute BOS; EOS is handled as its own token position
+        max_num_tokens = tgt.shape[1] - 2
+        # Special handling for 1-token sequences
+        if max_num_tokens == 1:
             return torch.arange(3, device=self._device).unsqueeze(0)
-        perms = [torch.arange(max_num_chars, device=self._device)] if self.perm_forward else []
+        perms = [torch.arange(max_num_tokens, device=self._device)] if self.perm_forward else []
         # Additional permutations if needed
-        max_perms = math.factorial(max_num_chars)
+        max_perms = math.factorial(max_num_tokens)
         if self.perm_mirrored:
             max_perms //= 2
         num_gen_perms = min(self.max_gen_perms, max_perms)
-        # For 4-char sequences and shorter, we generate all permutations and sample from the pool to avoid collisions
-        # Note that this code path might NEVER get executed since the labels in a mini-batch typically exceed 4 chars.
-        if max_num_chars < 5:
+        # For 4-token sequences and shorter, we generate all permutations and sample from the pool to avoid collisions
+        # Note that this code path might NEVER get executed since the labels in a mini-batch typically exceed 4 tokens.
+        if max_num_tokens < 5:
             # Pool of permutations to sample from. We only need the first half (if complementary option is selected)
-            # Special handling for max_num_chars == 4 which correctly divides the pool into the flipped halves
-            if max_num_chars == 4 and self.perm_mirrored:
+            # Special handling for max_num_tokens == 4 which correctly divides the pool into the flipped halves
+            if max_num_tokens == 4 and self.perm_mirrored:
                 selector = [0, 3, 4, 6, 9, 10, 12, 16, 17, 18, 19, 21]
             else:
                 selector = list(range(max_perms))
             perm_pool = torch.as_tensor(
-                list(permutations(range(max_num_chars), max_num_chars)),
+                list(permutations(range(max_num_tokens), max_num_tokens)),
                 device=self._device,
             )[selector]
             # If the forward permutation is always selected, no need to add it to the pool for sampling
@@ -125,29 +136,29 @@ class PARSeq(CrossEntropySystem):
                 perms = torch.cat([perms, perm_pool[i]])
         else:
             perms.extend(
-                [torch.randperm(max_num_chars, device=self._device) for _ in range(num_gen_perms - len(perms))]
+                [torch.randperm(max_num_tokens, device=self._device) for _ in range(num_gen_perms - len(perms))]
             )
             perms = torch.stack(perms)
         if self.perm_mirrored:
             # Add complementary pairs
             comp = perms.flip(-1)
             # Stack in such a way that the pairs are next to each other.
-            perms = torch.stack([perms, comp]).transpose(0, 1).reshape(-1, max_num_chars)
+            perms = torch.stack([perms, comp]).transpose(0, 1).reshape(-1, max_num_tokens)
         # NOTE:
-        # The only meaningful way of permuting the EOS position is by moving it one character position at a time.
+        # The only meaningful way of permuting the EOS position is by moving it one token position at a time.
         # However, since the number of permutations = T! and number of EOS positions = T + 1, the number of possible EOS
         # positions will always be much less than the number of permutations (unless a low perm_num is set).
         # Thus, it would be simpler to just train EOS using the full and null contexts rather than trying to evenly
         # distribute it across the chosen number of permutations.
         # Add position indices of BOS and EOS
         bos_idx = perms.new_zeros((len(perms), 1))
-        eos_idx = perms.new_full((len(perms), 1), max_num_chars + 1)
+        eos_idx = perms.new_full((len(perms), 1), max_num_tokens + 1)
         perms = torch.cat([bos_idx, perms + 1, eos_idx], dim=1)
         # Special handling for the reverse direction. This does two things:
-        # 1. Reverse context for the characters
+        # 1. Reverse context for the predictable tokens
         # 2. Null context for [EOS] (required for learning to predict [EOS] in NAR mode)
         if len(perms) > 1:
-            perms[1, 1:] = max_num_chars + 1 - torch.arange(max_num_chars + 1, device=self._device)
+            perms[1, 1:] = max_num_tokens + 1 - torch.arange(max_num_tokens + 1, device=self._device)
         return perms
 
     def generate_attn_masks(self, perm):

@@ -13,6 +13,14 @@ dec_num_heads: 12
 dec_mlp_ratio: 4
 dec_depth: 1
 
+
+# Tokenizer
+# Keep char-level behavior by default. To train with selected LaTeX commands
+# as single sequence tokens, set tokenizer_type: latex_hybrid and provide
+# latex_tokens from a charset/config override such as configs/charset/latex_hybrid.yaml.
+tokenizer_type: char
+latex_tokens: []
+
 # Training
 lr: 7e-4
 perm_num: 6

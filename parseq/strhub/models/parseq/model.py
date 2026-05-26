@@ -22,7 +22,7 @@ from torch import Tensor
 
 from timm.models.helpers import named_apply
 
-from strhub.data.utils import Tokenizer
+from strhub.data.utils import BaseTokenizer
 from strhub.models.utils import init_weights
 
 from .modules import Decoder, DecoderLayer, Encoder, TokenEmbedding
@@ -102,7 +102,7 @@ class PARSeq(nn.Module):
         tgt_query = self.dropout(tgt_query)
         return self.decoder(tgt_query, tgt_emb, memory, tgt_query_mask, tgt_mask, tgt_padding_mask)
 
-    def forward(self, tokenizer: Tokenizer, images: Tensor, max_length: Optional[int] = None) -> Tensor:
+    def forward(self, tokenizer: BaseTokenizer, images: Tensor, max_length: Optional[int] = None) -> Tensor:
         testing = max_length is None
         max_length = self.max_label_length if max_length is None else min(max_length, self.max_label_length)
         bs = images.shape[0]
