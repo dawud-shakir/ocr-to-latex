@@ -18,7 +18,7 @@ from pathlib import Path
 
 import hydra
 from hydra.core.hydra_config import HydraConfig
-from omegaconf import DictConfig, open_dict
+from omegaconf import DictConfig, OmegaConf, open_dict
 
 import torch
 
@@ -31,6 +31,7 @@ from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.utilities.model_summary import summarize
 
 from strhub.data.module import SceneTextDataModule
+from strhub.data.utils import Tokenizer
 from strhub.models.base import BaseSystem
 from strhub.models.utils import get_pretrained_weights
 
@@ -50,6 +51,213 @@ def get_swa_lr_factor(warmup_pct, swa_epoch_start, div_factor=25, final_div_fact
     step_num = int(total_steps * swa_epoch_start) - 1
     pct = (step_num - start_step) / (end_step - start_step)
     return _annealing_cos(1, 1 / (div_factor * final_div_factor), pct)
+
+
+VOCAB_DEPENDENT_KEYS = {
+    'head.weight',
+    'head.bias',
+    'text_embed.embedding.weight',
+}
+
+
+def _get_cfg_value(config: DictConfig, key: str, default=None):
+    """Best-effort OmegaConf get that also checks config.model."""
+    try:
+        value = config.get(key, default)
+    except Exception:
+        value = default
+    if value is not None:
+        return value
+    try:
+        return config.model.get(key, default)
+    except Exception:
+        return default
+
+
+def _resolve_pretrained_charset_train(config: DictConfig) -> str:
+    """Return the tokenizer charset used by the pretrained PARSeq checkpoint.
+
+    The public PARSeq pretrained checkpoints, including parseq-tiny, use the
+    repo's 94_full charset. Keep this configurable so a future checkpoint with a
+    different source charset can still use token-aware row transfer safely.
+    """
+    explicit_charset = _get_cfg_value(config, 'pretrained_charset_train', None)
+    if explicit_charset:
+        return str(explicit_charset)
+
+    charset_name = str(_get_cfg_value(config, 'pretrained_charset', '94_full') or '94_full')
+    if charset_name.endswith('.yaml'):
+        charset_name = charset_name[:-5]
+    charset_path = Path(__file__).resolve().parent / 'configs' / 'charset' / f'{charset_name}.yaml'
+    if not charset_path.exists():
+        raise FileNotFoundError(
+            f"Could not resolve pretrained charset config {charset_name!r}: {charset_path}. "
+            "Set pretrained_charset_train explicitly if this checkpoint did not use configs/charset/94_full.yaml."
+        )
+    charset_cfg = OmegaConf.load(charset_path)
+    return str(charset_cfg.model.charset_train)
+
+
+def _tokenizer_maps(tokenizer) -> tuple[dict[str, int], dict[int, str]]:
+    stoi = {str(k): int(v) for k, v in getattr(tokenizer, '_stoi', {}).items()}
+    itos_raw = getattr(tokenizer, '_itos', ())
+    itos = {int(i): str(tok) for i, tok in enumerate(itos_raw)}
+    return stoi, itos
+
+
+def _is_predicted_row(tokenizer, token_id: int, num_rows: int) -> bool:
+    """Return True when a tokenizer id has a corresponding output-head row."""
+    # PARSeq's head predicts every token except BOS and PAD. In the tokenizer
+    # layouts used here, BOS/PAD are the final ids and therefore outside the
+    # head row count, but keep this explicit for readability/safety.
+    bos_id = getattr(tokenizer, 'bos_id', None)
+    pad_id = getattr(tokenizer, 'pad_id', None)
+    return 0 <= int(token_id) < int(num_rows) and token_id not in {bos_id, pad_id}
+
+
+def _copy_vocab_rows_by_token(
+    key: str,
+    pretrained_tensor: torch.Tensor,
+    current_tensor: torch.Tensor,
+    source_tokenizer: Tokenizer,
+    dest_tokenizer,
+    *,
+    init_new_from_spelling: bool = True,
+) -> tuple[torch.Tensor, int, int, int]:
+    """Copy vocab-dependent rows by token string rather than by raw row index.
+
+    This avoids both failure modes:
+      1. shape mismatch -> all character rows skipped;
+      2. same shape but different token order -> silent class-meaning mismatch.
+
+    For new multi-character hybrid tokens such as r"\theta", optionally initialize
+    their rows from the average of their source character rows (e.g. '\\', 't',
+    'h', 'e', 't', 'a') when those characters exist in the pretrained tokenizer.
+    """
+    out = current_tensor.clone()
+    src_stoi, _src_itos = _tokenizer_maps(source_tokenizer)
+    dst_stoi, dst_itos = _tokenizer_maps(dest_tokenizer)
+
+    if pretrained_tensor.ndim != current_tensor.ndim:
+        return out, 0, 0, 0
+    if pretrained_tensor.ndim > 1 and pretrained_tensor.shape[1:] != current_tensor.shape[1:]:
+        return out, 0, 0, 0
+
+    src_rows = int(pretrained_tensor.shape[0])
+    dst_rows = int(current_tensor.shape[0])
+    is_head = key in {'head.weight', 'head.bias'}
+
+    direct = 0
+    spelling = 0
+    skipped = 0
+
+    for dst_id in range(dst_rows):
+        token = dst_itos.get(dst_id)
+        if token is None:
+            skipped += 1
+            continue
+        if is_head and not _is_predicted_row(dest_tokenizer, dst_id, dst_rows):
+            continue
+
+        src_id = src_stoi.get(token)
+        if src_id is not None:
+            if (not is_head or _is_predicted_row(source_tokenizer, src_id, src_rows)) and 0 <= src_id < src_rows:
+                out[dst_id].copy_(pretrained_tensor[src_id])
+                direct += 1
+            else:
+                skipped += 1
+            continue
+
+        if not init_new_from_spelling or len(token) <= 1:
+            skipped += 1
+            continue
+
+        piece_ids: list[int] = []
+        can_spell = True
+        for ch in token:
+            ch_id = src_stoi.get(ch)
+            if ch_id is None or ch_id < 0 or ch_id >= src_rows:
+                can_spell = False
+                break
+            if is_head and not _is_predicted_row(source_tokenizer, ch_id, src_rows):
+                can_spell = False
+                break
+            piece_ids.append(ch_id)
+
+        if can_spell and piece_ids:
+            rows = pretrained_tensor[piece_ids]
+            out[dst_id].copy_(rows.mean(dim=0))
+            spelling += 1
+        else:
+            skipped += 1
+
+    return out, direct, spelling, skipped
+
+
+def _load_pretrained_token_aware(model: BaseSystem, inner_model: torch.nn.Module, config: DictConfig) -> None:
+    """Load pretrained weights with token-aware row transfer for resized vocab layers."""
+    pretrained = get_pretrained_weights(config.pretrained)
+    current = inner_model.state_dict()
+
+    transfer_vocab_by_token = bool(_get_cfg_value(config, 'pretrained_transfer_vocab_by_token', True))
+    init_new_from_spelling = bool(_get_cfg_value(config, 'pretrained_init_new_tokens_from_spelling', True))
+
+    dest_tokenizer = getattr(model, 'tokenizer', None)
+    source_tokenizer = None
+    if transfer_vocab_by_token and dest_tokenizer is not None:
+        pretrained_charset_train = _resolve_pretrained_charset_train(config)
+        source_tokenizer = Tokenizer(pretrained_charset_train)
+        print(
+            "Token-aware pretrained transfer: "
+            f"source pretrained_charset={_get_cfg_value(config, 'pretrained_charset', '94_full')!r}, "
+            f"source_vocab={len(source_tokenizer)}, dest_vocab={len(dest_tokenizer)}, "
+            f"init_new_from_spelling={init_new_from_spelling}",
+            flush=True,
+        )
+
+    loadable: dict[str, torch.Tensor] = {}
+    skipped: list[str] = []
+    row_transfer_report: list[str] = []
+
+    for key, pretrained_tensor in pretrained.items():
+        if key not in current:
+            continue
+
+        current_tensor = current[key]
+
+        # Vocab-dependent tensors need token-name-aware transfer even when the
+        # shapes happen to match. Same shape does not guarantee same token ids.
+        if key in VOCAB_DEPENDENT_KEYS and source_tokenizer is not None and dest_tokenizer is not None:
+            patched, direct, spelling, row_skipped = _copy_vocab_rows_by_token(
+                key,
+                pretrained_tensor,
+                current_tensor,
+                source_tokenizer,
+                dest_tokenizer,
+                init_new_from_spelling=init_new_from_spelling,
+            )
+            loadable[key] = patched
+            row_transfer_report.append(
+                f"{key}: copied_matching={direct}, initialized_from_spelling={spelling}, left_random={row_skipped}"
+            )
+            continue
+
+        if pretrained_tensor.shape == current_tensor.shape:
+            loadable[key] = pretrained_tensor
+        else:
+            skipped.append(key)
+
+    if row_transfer_report:
+        print("Token-aware vocab row transfer:", flush=True)
+        for line in row_transfer_report:
+            print("  " + line, flush=True)
+
+    if skipped:
+        print("Skipped pretrained layers due to shape mismatch:", skipped, flush=True)
+    else:
+        print("Skipped pretrained layers due to shape mismatch: []", flush=True)
+
+    inner_model.load_state_dict(loadable, strict=False)
 
 
 @hydra.main(config_path='configs', config_name='main', version_base='1.2')
@@ -89,42 +297,17 @@ def main(config: DictConfig):
         assert config.model.perm_num % 2 == 0, 'perm_num should be even if perm_mirrored = True'
 
     model: BaseSystem = hydra.utils.instantiate(config.model)
-    # If specified, use pretrained weights to initialize the model
+    # If specified, use pretrained weights to initialize the model.
     if config.pretrained is not None:
         m = model.model if config.model._target_.endswith('PARSeq') else model
 
-        # The pretrained PARSeq checkpoint was trained with its original charset.
-        # For handwriting fine-tuning, we may use a custom charset containing spaces,
-        # math symbols, Greek letters, etc. Changing the charset changes the shape of
-        # charset-dependent layers such as:
-        #
-        #   - head.weight / head.bias
-        #   - text_embed.embedding.weight
-        #
-        # A strict load_state_dict() would fail on those shape mismatches. Instead,
-        # load only the pretrained tensors whose names and shapes still match the
-        # current model. This keeps the useful pretrained encoder/decoder weights,
-        # while leaving the resized charset-specific layers randomly initialized so
-        # they can learn the custom handwriting symbols during fine-tuning. 
-        # (dawud, 2026-05-17)
-
-        # m.load_state_dict(get_pretrained_weights(config.pretrained))
-        pretrained = get_pretrained_weights(config.pretrained)
-        current = m.state_dict()
-
-        compatible = {
-            k: v for k, v in pretrained.items()
-            if k in current and v.shape == current[k].shape
-        }
-
-        skipped = [
-            k for k, v in pretrained.items()
-            if k in current and v.shape != current[k].shape
-        ]
-
-        print("Skipped pretrained layers due to shape mismatch:", skipped)
-
-        m.load_state_dict(compatible, strict=False)
+        # Hybrid LaTeX fine-tuning changes the tokenizer/vocabulary. A plain
+        # shape-compatible load is not enough: if token order changes, same-shaped
+        # rows can silently mean the wrong class. Instead, copy vocab-dependent
+        # rows by token string. Existing characters such as "a", "t", "=" keep
+        # their pretrained rows, while new hybrid tokens such as r"\theta" or
+        # r"_{" are initialized fresh or from the average of their spelling pieces.
+        _load_pretrained_token_aware(model, m, config)
 
     print(summarize(model, max_depth=2))
 

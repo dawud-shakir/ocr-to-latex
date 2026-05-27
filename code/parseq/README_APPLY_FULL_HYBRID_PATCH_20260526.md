@@ -24,3 +24,40 @@ configs/charset/latex_hybrid.yaml
 ## Important
 
 After applying this patch, retrain from scratch or from the pretrained PARSeq weights. Old checkpoints trained before this fix may have learned stripped labels such as `theta` instead of the hybrid token `\theta`.
+
+## 2026-05-27 token-aware pretrained row transfer
+
+The training loader now handles resized/custom vocabularies more carefully.
+Instead of skipping the entire vocab-dependent tensors when the hybrid charset
+changes shape, it transfers rows by token string:
+
+```text
+pretrained "a" row  -> current "a" row
+pretrained "t" row  -> current "t" row
+pretrained "=" row  -> current "=" row
+new "\\theta" row   -> initialized from spelling pieces when possible
+new "_{" row        -> initialized from spelling pieces when possible
+```
+
+This applies to:
+
+```text
+head.weight
+head.bias
+text_embed.embedding.weight
+```
+
+The loader also uses token-name-aware transfer even if a future custom vocabulary
+happens to have the same shape as the pretrained vocabulary. This prevents silent
+class-meaning misalignment when token order changes.
+
+Config options in `configs/main.yaml`:
+
+```yaml
+pretrained_charset: 94_full
+pretrained_charset_train: null
+pretrained_transfer_vocab_by_token: true
+pretrained_init_new_tokens_from_spelling: true
+```
+
+For normal `pretrained=parseq-tiny`, leave these defaults alone.

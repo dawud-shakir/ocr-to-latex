@@ -50,6 +50,14 @@ train_without_val: false
 ckpt_path: null
 pretrained: null
 
+# Source charset used by public PARSeq pretrained checkpoints such as parseq-tiny.
+# Token-aware pretrained transfer uses this to copy matching character rows into
+# custom/hybrid vocabularies instead of discarding the whole output head.
+pretrained_charset: 94_full
+pretrained_charset_train: null
+pretrained_transfer_vocab_by_token: true
+pretrained_init_new_tokens_from_spelling: true
+
 hydra:
   output_subdir: config
   run:
