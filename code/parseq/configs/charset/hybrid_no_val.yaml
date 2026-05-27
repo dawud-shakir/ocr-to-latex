@@ -1,0 +1,12 @@
+# @package _global_
+# Generated from labels as they would be exported with the current options.
+# Added 1 discovered latex token(s) from labels.
+model:
+  tokenizer_type: latex_hybrid
+  charset_train: "0123589abcdefghijklmnopqrstuvwxyzABCDFLRSTW'()+,-./:=?|}"
+  latex_tokens:
+    - "_{"
+    - "\\theta"
+    - "\\infty"
+    - "\\leq"
+    - "\\to"

@@ -1,0 +1,526 @@
+--- a/train.py
++++ b/train.py
+@@ -23,6 +23,8 @@
+ import torch
+ 
+ from pytorch_lightning import Trainer
++# SWA is intentionally not imported by default for this custom handwriting fine-tuning script.
++# To disable SWA, comment this import:
+ from pytorch_lightning.callbacks import ModelCheckpoint, StochasticWeightAveraging
+ from pytorch_lightning.loggers import TensorBoardLogger
+ from pytorch_lightning.strategies import DDPStrategy
+@@ -53,9 +55,20 @@
+ @hydra.main(config_path='configs', config_name='main', version_base='1.2')
+ def main(config: DictConfig):
+     trainer_strategy = 'auto'
++    train_without_val = bool(config.get('train_without_val', False))
++
+     with open_dict(config):
+         # Resolve absolute path to data.root_dir
+         config.data.root_dir = hydra.utils.to_absolute_path(config.data.root_dir)
++
++        # Optional train-only mode. This is useful for quick experiments or a final
++        # train-on-everything run where root_dir/val is intentionally absent.
++        # Normal behavior is unchanged when train_without_val is false.
++        config.data.allow_missing_val = bool(config.data.get('allow_missing_val', False) or train_without_val)
++        if train_without_val:
++            config.trainer.limit_val_batches = 0
++            config.trainer.num_sanity_val_steps = 0
++
+         # Special handling for GPU-affected config
+         gpu = config.trainer.get('accelerator') == 'gpu'
+         devices = config.trainer.get('devices', 0)
+@@ -66,7 +79,8 @@
+             # Use DDP with optimizations
+             trainer_strategy = DDPStrategy(find_unused_parameters=False, gradient_as_bucket_view=True)
+             # Scale steps-based config
+-            config.trainer.val_check_interval //= devices
++            if not train_without_val and config.trainer.get('val_check_interval') is not None:
++                config.trainer.val_check_interval //= devices
+             if config.trainer.get('max_steps', -1) > 0:
+                 config.trainer.max_steps //= devices
+ 
+@@ -116,15 +130,58 @@
+ 
+     datamodule: SceneTextDataModule = hydra.utils.instantiate(config.data)
+ 
+-    # Select checkpoints by val_NED instead of val_accuracy. (dawud 2026-05-19)
+-    checkpoint = ModelCheckpoint(
+-        monitor='val_NED',
+-        mode='max',
+-        save_top_k=3,
+-        save_last=True,
+-        filename='{epoch}-{step}-{val_accuracy:.4f}-{val_NED:.4f}',
+-    )
+-
++    if train_without_val:
++        # Train-only mode: validation metrics will not exist, so checkpoint by
++        # epoch-aggregated training loss instead of val_NED.
++        checkpoint = ModelCheckpoint(
++            monitor='train_loss',
++            mode='min',
++            save_top_k=3,
++            save_last=True,
++            save_on_train_epoch_end=True,
++            filename='{epoch}-{step}-{train_loss:.4f}',
++        )
++        if trainer_strategy == 'auto':
++            print(
++                "Training without validation: checkpointing by train_loss. "
++                "No val_accuracy/val_NED metrics will be logged.",
++                flush=True,
++            )
++    else:
++        # Select checkpoints by validation NED instead of exact-match accuracy. (dawud 2026-05-19)
++        checkpoint = ModelCheckpoint(
++            monitor='val_NED',
++            mode='max',
++            save_top_k=3,
++            save_last=True,
++            filename='{epoch}-{step}-{val_accuracy:.4f}-{val_NED:.4f}',
++        )
++    # checkpoint = ModelCheckpoint(
++    #     monitor='val_accuracy',
++    #     mode='max',
++    #     save_top_k=3,
++    #     save_last=True,
++    #     filename='{epoch}-{step}-{val_accuracy:.4f}-{val_NED:.4f}',
++    # )
++
++
++    # SWA / Stochastic Weight Averaging note:
++    #
++    # SWA can be useful because it averages model weights from the late part of training.
++    # On many larger or more stable datasets, that averaging can land the model in a smoother
++    # region of the loss surface and improve generalization compared with one noisy final
++    # checkpoint.
++    #
++    # For this small custom handwriting/PARSeq fine-tuning setup, SWA is disabled for now.
++    # The validation logs showed the model often reached its best recognition metrics before
++    # the SWA phase, then became noisier or worse after Lightning swapped OneCycleLR for SWALR.
++    # With a small validation set and charset-dependent output layers being trained from
++    # scratch, the averaged late weights can smooth away a good specialized checkpoint rather
++    # than improve it.
++    #
++    # To enable SWA, uncomment the three lines below, restore the import above, and
++    # change callbacks=[checkpoint] to callbacks=[checkpoint, swa].  (dawud, 2026-05-19)
++    #
+     swa_epoch_start = 0.75
+     swa_lr = config.model.lr * get_swa_lr_factor(config.model.warmup_pct, swa_epoch_start)
+     swa = StochasticWeightAveraging(swa_lr, swa_epoch_start)
+@@ -139,6 +196,9 @@
+         strategy=trainer_strategy,
+         enable_model_summary=False,
+         callbacks=[checkpoint, swa],
++        # If SWA is disabled above, use this instead:
++        # callbacks=[checkpoint],
++        
+     )
+     trainer.fit(model, datamodule=datamodule, ckpt_path=config.ckpt_path)
+ 
+--- a/README_HYBRID_TOKENIZER_PATCH.md
++++ b/README_HYBRID_TOKENIZER_PATCH.md
+@@ -75,3 +75,17 @@
+ x_{2}        -> ['x', '_{', '2', '}']
+ y^{(0 + 0)}  -> ['y', '^{', '(', '0', ' ', '+', ' ', '0', ')', '}']
+ ```
++
++
++## 2026-05-26 full hybrid-data-path patch
++
++This patch includes the full set of files needed for hybrid LaTeX token training:
++
++- `strhub/data/latex_tokenizer.py`: longest-match hybrid tokens, including non-backslash tokens like `_{` and `^{`.
++- `strhub/data/dataset.py`: accepts optional label adapter and token-length function; hybrid max length is measured in tokenizer units.
++- `strhub/data/module.py`: when `tokenizer_type=latex_hybrid`, preserves raw LaTeX labels until `HybridLatexTokenizer` validates/tokenizes them. This prevents `\theta` from being stripped to `theta` before training.
++- `strhub/models/base.py`: keeps raw LaTeX predictions/labels for validation metrics instead of applying `CharsetAdapter`.
++- `configs/main.yaml`: passes `model.tokenizer_type` and `model.latex_tokens` into the data module.
++- `configs/charset/latex_hybrid.yaml`: keeps `latex_tokens` under `model` so Hydra passes them into both the model and data module.
++
++This patch also includes the train-without-validation convenience changes from the no-val patch, so it can be applied as one combined patch instead of applying hybrid and no-val patches separately.
+--- a/configs/main.yaml
++++ b/configs/main.yaml
+@@ -24,11 +24,14 @@
+   img_size: ${model.img_size}
+   charset_train: ${model.charset_train}
+   charset_test: ${model.charset_test}
++  tokenizer_type: ${model.tokenizer_type}
++  latex_tokens: ${model.latex_tokens}
+   max_label_length: ${model.max_label_length}
+   remove_whitespace: true
+   normalize_unicode: true
+   augment: true
+   num_workers: 2
++  allow_missing_val: ${train_without_val}
+ 
+ trainer:
+   _target_: pytorch_lightning.Trainer
+@@ -40,6 +43,10 @@
+   accelerator: gpu
+   devices: 2
+ 
++# Set true to allow a train-only run when root_dir/val is intentionally absent.
++# When true, train.py disables validation and checkpoints by train_loss instead of val_NED.
++train_without_val: false
++
+ ckpt_path: null
+ pretrained: null
+ 
+--- a/configs/charset/latex_hybrid.yaml
++++ b/configs/charset/latex_hybrid.yaml
+@@ -1,50 +1,48 @@
+ # @package _global_
+-# Character fallback + selected multi-character LaTeX command tokens.
++# Character fallback + selected multi-character LaTeX command/structure tokens.
+ #
+-# `max_label_length` is now measured in hybrid tokens when tokenizer_type is
+-# latex_hybrid. For example, \frac{x+1}{y} becomes:
+-#   [\frac] [{] [x] [+] [1] [}] [{] [y] [}]
++# In latex_hybrid mode, max_label_length is measured in hybrid tokens.
++# Example: r"\\theta" is one token, and x_{2} tokenizes as [x] [_{] [2] [}].
+ model:
+   tokenizer_type: latex_hybrid
+   charset_train: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ "
++  charset_test: ${model.charset_train}
++  latex_tokens:
++    # structural:
++    - "_{"
++    - "^{"
++    - "}{"
+ 
+-latex_tokens:
++    # group-opening commands:
++    - "\\frac{"
++    - "\\sqrt{"
+ 
+-  # structural:
+-  - "_{"
+-  - "^{"
+-  - "}{"
++    # symbol commands:
++    - "\\alpha"
++    - "\\beta"
++    - "\\gamma"
++    - "\\theta"
++    - "\\lambda"
++    - "\\mu"
++    - "\\pi"
++    - "\\Sigma"
++    - "\\sum"
++    - "\\int"
++    - "\\infty"
++    - "\\leq"
++    - "\\geq"
++    - "\\neq"
++    - "\\cdot"
++    - "\\times"
++    - "\\to"
++    - "\\rightarrow"
+ 
+-  # group-opening commands:
+-  - "\\frac{"
+-  - "\\sqrt{"
+-
+-  # symbol commands:
+-  - "\\alpha"
+-  - "\\beta"
+-  - "\\gamma"
+-  - "\\theta"
+-  - "\\lambda"
+-  - "\\mu"
+-  - "\\pi"
+-  - "\\Sigma"
+-  - "\\sum"
+-  - "\\int"
+-  - "\\infty"
+-  - "\\leq"
+-  - "\\geq"
+-  - "\\neq"
+-  - "\\cdot"
+-  - "\\times"
+-  - "\\to"
+-  - "\\rightarrow"
+-
+-  # function commands:
+-  - "\\sin"
+-  - "\\cos"
+-  - "\\tan"
+-  - "\\log"
+-  - "\\ln"
+-  - "\\lim"
+-  - "\\max"
+-  - "\\min"
+\ No newline at end of file
++    # function commands:
++    - "\\sin"
++    - "\\cos"
++    - "\\tan"
++    - "\\log"
++    - "\\ln"
++    - "\\lim"
++    - "\\max"
++    - "\\min"
+--- a/strhub/data/dataset.py
++++ b/strhub/data/dataset.py
+@@ -65,6 +65,8 @@
+         normalize_unicode: bool = True,
+         unlabelled: bool = False,
+         transform: Optional[Callable] = None,
++        label_adapter: Optional[Callable[[str], str]] = None,
++        label_length: Optional[Callable[[str], int]] = None,
+     ):
+         self._env = None
+         self.root = root
+@@ -73,7 +75,13 @@
+         self.labels = []
+         self.filtered_index_list = []
+         self.num_samples = self._preprocess_labels(
+-            charset, remove_whitespace, normalize_unicode, max_label_len, min_image_dim
++            charset,
++            remove_whitespace,
++            normalize_unicode,
++            max_label_len,
++            min_image_dim,
++            label_adapter=label_adapter,
++            label_length=label_length,
+         )
+ 
+     def __del__(self):
+@@ -92,8 +100,23 @@
+             self._env = self._create_env()
+         return self._env
+ 
+-    def _preprocess_labels(self, charset, remove_whitespace, normalize_unicode, max_label_len, min_image_dim):
+-        charset_adapter = CharsetAdapter(charset)
++    def _preprocess_labels(
++        self,
++        charset,
++        remove_whitespace,
++        normalize_unicode,
++        max_label_len,
++        min_image_dim,
++        *,
++        label_adapter: Optional[Callable[[str], str]] = None,
++        label_length: Optional[Callable[[str], int]] = None,
++    ):
++        # Default PARSeq behavior: adapt raw labels with a character-level
++        # CharsetAdapter. Hybrid LaTeX training passes its own adapter/length
++        # function so labels such as r"\theta" and r"x_{2}" are validated by
++        # the tokenizer instead of being character-stripped before tokenization.
++        charset_adapter = label_adapter or CharsetAdapter(charset)
++        length_fn = label_length or len
+         with self._create_env() as env, env.begin() as txn:
+             num_samples = int(txn.get('num-samples'.encode()))
+             if self.unlabelled:
+@@ -108,19 +131,26 @@
+                 # Normalize unicode composites (if any) and convert to compatible ASCII characters
+                 if normalize_unicode:
+                     label = unicodedata.normalize('NFKD', label).encode('ascii', 'ignore').decode()
+-                # Filter by length before removing unsupported characters. The original label might be too long.
+-                if len(label) > max_label_len:
++                try:
++                    label = charset_adapter(label)
++                    label_len = length_fn(label)
++                except Exception as exc:
++                    log.debug('Skipping label %r from %s: %s', label, self.root, exc)
+                     continue
+-                label = charset_adapter(label)
+-                # We filter out samples which don't contain any supported characters
++                # We filter out samples which don't contain any supported tokens/characters.
+                 if not label:
+                     continue
++                # For hybrid tokenizers, max_label_len is measured in tokenizer
++                # units, not raw Python characters. Example: r"\theta" has raw
++                # length 6 but hybrid-token length 1.
++                if label_len > max_label_len:
++                    continue
+                 # Filter images that are too small.
+                 if min_image_dim > 0:
+                     img_key = f'image-{index:09d}'.encode()
+                     buf = io.BytesIO(txn.get(img_key))
+                     w, h = Image.open(buf).size
+-                    if w < self.min_image_dim or h < self.min_image_dim:
++                    if w < min_image_dim or h < min_image_dim:
+                         continue
+                 self.labels.append(label)
+                 self.filtered_index_list.append(index)
+--- a/strhub/data/module.py
++++ b/strhub/data/module.py
+@@ -13,7 +13,7 @@
+ # See the License for the specific language governing permissions and
+ # limitations under the License.
+ 
+-from pathlib import PurePath
++from pathlib import Path, PurePath
+ from typing import Callable, Optional, Sequence
+ 
+ from torch.utils.data import DataLoader
+@@ -22,6 +22,7 @@
+ import pytorch_lightning as pl
+ 
+ from .dataset import LmdbDataset, build_tree_dataset
++from .latex_tokenizer import HybridLatexTokenizer
+ 
+ 
+ class SceneTextDataModule(pl.LightningDataModule):
+@@ -46,6 +47,9 @@
+         min_image_dim: int = 0,
+         rotation: int = 0,
+         collate_fn: Optional[Callable] = None,
++        tokenizer_type: str = 'char',
++        latex_tokens: Optional[Sequence[str]] = None,
++        allow_missing_val: bool = False,
+     ):
+         super().__init__()
+         self.root_dir = root_dir
+@@ -62,6 +66,10 @@
+         self.min_image_dim = min_image_dim
+         self.rotation = rotation
+         self.collate_fn = collate_fn
++        self.tokenizer_type = tokenizer_type
++        self.latex_tokens = list(latex_tokens or [])
++        self.allow_missing_val = allow_missing_val
++        self._label_tokenizer = None
+         self._train_dataset = None
+         self._val_dataset = None
+ 
+@@ -81,11 +89,39 @@
+         ])
+         return T.Compose(transforms)
+ 
++    def _label_adapter_and_length(self) -> tuple[Optional[Callable[[str], str]], Optional[Callable[[str], int]]]:
++        """Return dataset-side label adapter/length functions.
++
++        Character PARSeq keeps the stock CharsetAdapter behavior inside
++        LmdbDataset. Hybrid LaTeX PARSeq must preserve raw labels such as
++        r"\theta" and r"x_{2}" until HybridLatexTokenizer sees them. Otherwise
++        CharsetAdapter can silently strip the backslash/underscore/caret and
++        train the model on labels like "theta" instead of r"\theta".
++        """
++        if self.tokenizer_type != 'latex_hybrid':
++            return None, None
++
++        if self._label_tokenizer is None:
++            self._label_tokenizer = HybridLatexTokenizer(self.charset_train, self.latex_tokens)
++        tokenizer = self._label_tokenizer
++
++        def adapt(label: str) -> str:
++            # Validate without altering the raw label. Any unsupported character
++            # or missed hybrid token raises and the sample is skipped.
++            tokenizer.tokenize(label)
++            return label
++
++        def length(label: str) -> int:
++            return len(tokenizer.tokenize(label))
++
++        return adapt, length
++
+     @property
+     def train_dataset(self):
+         if self._train_dataset is None:
+             transform = self.get_transform(self.img_size, self.augment)
+             root = PurePath(self.root_dir, 'train', self.train_dir)
++            label_adapter, label_length = self._label_adapter_and_length()
+             self._train_dataset = build_tree_dataset(
+                 root,
+                 self.charset_train,
+@@ -94,6 +130,8 @@
+                 self.remove_whitespace,
+                 self.normalize_unicode,
+                 transform=transform,
++                label_adapter=label_adapter,
++                label_length=label_length,
+             )
+         return self._train_dataset
+ 
+@@ -101,15 +139,20 @@
+     def val_dataset(self):
+         if self._val_dataset is None:
+             transform = self.get_transform(self.img_size)
+-            root = PurePath(self.root_dir, 'val')
++            root = Path(self.root_dir, 'val')
++            if self.allow_missing_val and not root.exists():
++                return None
++            label_adapter, label_length = self._label_adapter_and_length()
+             self._val_dataset = build_tree_dataset(
+                 root,
+-                self.charset_test,
++                self.charset_train if self.tokenizer_type == 'latex_hybrid' else self.charset_test,
+                 self.max_label_length,
+                 self.min_image_dim,
+                 self.remove_whitespace,
+                 self.normalize_unicode,
+                 transform=transform,
++                label_adapter=label_adapter,
++                label_length=label_length,
+             )
+         return self._val_dataset
+ 
+@@ -125,8 +168,11 @@
+         )
+ 
+     def val_dataloader(self):
++        dataset = self.val_dataset
++        if dataset is None:
++            return None
+         return DataLoader(
+-            self.val_dataset,
++            dataset,
+             batch_size=self.batch_size,
+             num_workers=self.num_workers,
+             persistent_workers=self.num_workers > 0,
+@@ -137,15 +183,18 @@
+     def test_dataloaders(self, subset):
+         transform = self.get_transform(self.img_size, rotation=self.rotation)
+         root = PurePath(self.root_dir, 'test')
++        label_adapter, label_length = self._label_adapter_and_length()
+         datasets = {
+             s: LmdbDataset(
+                 str(root / s),
+-                self.charset_test,
++                self.charset_train if self.tokenizer_type == 'latex_hybrid' else self.charset_test,
+                 self.max_label_length,
+                 self.min_image_dim,
+                 self.remove_whitespace,
+                 self.normalize_unicode,
+                 transform=transform,
++                label_adapter=label_adapter,
++                label_length=label_length,
+             )
+             for s in subset
+         }
+--- a/strhub/models/base.py
++++ b/strhub/models/base.py
+@@ -61,7 +61,11 @@
+     ) -> None:
+         super().__init__()
+         self.tokenizer = tokenizer
+-        self.charset_adapter = CharsetAdapter(charset_test)
++        # Character PARSeq adapts predictions to charset_test for evaluation.
++        # Hybrid LaTeX PARSeq should compare raw decoded LaTeX strings against
++        # raw LMDB labels; using CharsetAdapter here can strip backslashes and
++        # make metrics lie (e.g. r"\theta" -> "theta").
++        self.charset_adapter = (lambda label: label) if isinstance(tokenizer, HybridLatexTokenizer) else CharsetAdapter(charset_test)
+         self.batch_size = batch_size
+         self.lr = lr
+         self.warmup_pct = warmup_pct
+@@ -170,6 +174,8 @@
+         return result
+ 
+     def on_validation_epoch_end(self) -> None:
++        if not self.outputs:
++            return
+         acc, ned, loss = self._aggregate_results(self.outputs)
+         self.outputs.clear()
+ 
+--- a/strhub/models/parseq/system.py
++++ b/strhub/models/parseq/system.py
+@@ -207,5 +207,7 @@
+                 n = (tgt_out != self.pad_id).sum().item()
+         loss /= loss_numel
+ 
+-        self.log('loss', loss)
++        batch_size = images.shape[0]
++        self.log('loss', loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True, batch_size=batch_size)
++        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=batch_size)
+         return loss

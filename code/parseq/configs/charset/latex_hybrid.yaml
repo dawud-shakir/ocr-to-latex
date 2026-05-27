@@ -1,50 +1,48 @@
 # @package _global_
-# Character fallback + selected multi-character LaTeX command tokens.
+# Character fallback + selected multi-character LaTeX command/structure tokens.
 #
-# `max_label_length` is now measured in hybrid tokens when tokenizer_type is
-# latex_hybrid. For example, \frac{x+1}{y} becomes:
-#   [\frac] [{] [x] [+] [1] [}] [{] [y] [}]
+# In latex_hybrid mode, max_label_length is measured in hybrid tokens.
+# Example: r"\\theta" is one token, and x_{2} tokenizes as [x] [_{] [2] [}].
 model:
   tokenizer_type: latex_hybrid
   charset_train: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ "
+  charset_test: ${model.charset_train}
+  latex_tokens:
+    # structural:
+    - "_{"
+    - "^{"
+    - "}{"
 
-latex_tokens:
+    # group-opening commands:
+    - "\\frac{"
+    - "\\sqrt{"
 
-  # structural:
-  - "_{"
-  - "^{"
-  - "}{"
+    # symbol commands:
+    - "\\alpha"
+    - "\\beta"
+    - "\\gamma"
+    - "\\theta"
+    - "\\lambda"
+    - "\\mu"
+    - "\\pi"
+    - "\\Sigma"
+    - "\\sum"
+    - "\\int"
+    - "\\infty"
+    - "\\leq"
+    - "\\geq"
+    - "\\neq"
+    - "\\cdot"
+    - "\\times"
+    - "\\to"
+    - "\\rightarrow"
 
-  # group-opening commands:
-  - "\\frac{"
-  - "\\sqrt{"
-
-  # symbol commands:
-  - "\\alpha"
-  - "\\beta"
-  - "\\gamma"
-  - "\\theta"
-  - "\\lambda"
-  - "\\mu"
-  - "\\pi"
-  - "\\Sigma"
-  - "\\sum"
-  - "\\int"
-  - "\\infty"
-  - "\\leq"
-  - "\\geq"
-  - "\\neq"
-  - "\\cdot"
-  - "\\times"
-  - "\\to"
-  - "\\rightarrow"
-
-  # function commands:
-  - "\\sin"
-  - "\\cos"
-  - "\\tan"
-  - "\\log"
-  - "\\ln"
-  - "\\lim"
-  - "\\max"
-  - "\\min"
+    # function commands:
+    - "\\sin"
+    - "\\cos"
+    - "\\tan"
+    - "\\log"
+    - "\\ln"
+    - "\\lim"
+    - "\\max"
+    - "\\min"

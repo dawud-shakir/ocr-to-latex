@@ -207,5 +207,7 @@ class PARSeq(CrossEntropySystem):
                 n = (tgt_out != self.pad_id).sum().item()
         loss /= loss_numel
 
-        self.log('loss', loss)
+        batch_size = images.shape[0]
+        self.log('loss', loss, on_step=True, on_epoch=False, prog_bar=True, sync_dist=True, batch_size=batch_size)
+        self.log('train_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=batch_size)
         return loss

@@ -61,7 +61,11 @@ class BaseSystem(pl.LightningModule, ABC):
     ) -> None:
         super().__init__()
         self.tokenizer = tokenizer
-        self.charset_adapter = CharsetAdapter(charset_test)
+        # Character PARSeq adapts predictions to charset_test for evaluation.
+        # Hybrid LaTeX PARSeq should compare raw decoded LaTeX strings against
+        # raw LMDB labels; using CharsetAdapter here can strip backslashes and
+        # make metrics lie (e.g. r"\theta" -> "theta").
+        self.charset_adapter = (lambda label: label) if isinstance(tokenizer, HybridLatexTokenizer) else CharsetAdapter(charset_test)
         self.batch_size = batch_size
         self.lr = lr
         self.warmup_pct = warmup_pct
@@ -170,6 +174,8 @@ class BaseSystem(pl.LightningModule, ABC):
         return result
 
     def on_validation_epoch_end(self) -> None:
+        if not self.outputs:
+            return
         acc, ned, loss = self._aggregate_results(self.outputs)
         self.outputs.clear()
 

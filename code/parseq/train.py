@@ -23,6 +23,8 @@ from omegaconf import DictConfig, open_dict
 import torch
 
 from pytorch_lightning import Trainer
+# SWA is intentionally not imported by default for this custom handwriting fine-tuning script.
+# To disable SWA, comment this import:
 from pytorch_lightning.callbacks import ModelCheckpoint, StochasticWeightAveraging
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
@@ -53,9 +55,20 @@ def get_swa_lr_factor(warmup_pct, swa_epoch_start, div_factor=25, final_div_fact
 @hydra.main(config_path='configs', config_name='main', version_base='1.2')
 def main(config: DictConfig):
     trainer_strategy = 'auto'
+    train_without_val = bool(config.get('train_without_val', False))
+
     with open_dict(config):
         # Resolve absolute path to data.root_dir
         config.data.root_dir = hydra.utils.to_absolute_path(config.data.root_dir)
+
+        # Optional train-only mode. This is useful for quick experiments or a final
+        # train-on-everything run where root_dir/val is intentionally absent.
+        # Normal behavior is unchanged when train_without_val is false.
+        config.data.allow_missing_val = bool(config.data.get('allow_missing_val', False) or train_without_val)
+        if train_without_val:
+            config.trainer.limit_val_batches = 0
+            config.trainer.num_sanity_val_steps = 0
+
         # Special handling for GPU-affected config
         gpu = config.trainer.get('accelerator') == 'gpu'
         devices = config.trainer.get('devices', 0)
@@ -66,7 +79,8 @@ def main(config: DictConfig):
             # Use DDP with optimizations
             trainer_strategy = DDPStrategy(find_unused_parameters=False, gradient_as_bucket_view=True)
             # Scale steps-based config
-            config.trainer.val_check_interval //= devices
+            if not train_without_val and config.trainer.get('val_check_interval') is not None:
+                config.trainer.val_check_interval //= devices
             if config.trainer.get('max_steps', -1) > 0:
                 config.trainer.max_steps //= devices
 
@@ -116,15 +130,58 @@ def main(config: DictConfig):
 
     datamodule: SceneTextDataModule = hydra.utils.instantiate(config.data)
 
-    # Select checkpoints by val_NED instead of val_accuracy. (dawud 2026-05-19)
-    checkpoint = ModelCheckpoint(
-        monitor='val_NED',
-        mode='max',
-        save_top_k=3,
-        save_last=True,
-        filename='{epoch}-{step}-{val_accuracy:.4f}-{val_NED:.4f}',
-    )
+    if train_without_val:
+        # Train-only mode: validation metrics will not exist, so checkpoint by
+        # epoch-aggregated training loss instead of val_NED.
+        checkpoint = ModelCheckpoint(
+            monitor='train_loss',
+            mode='min',
+            save_top_k=3,
+            save_last=True,
+            save_on_train_epoch_end=True,
+            filename='{epoch}-{step}-{train_loss:.4f}',
+        )
+        if trainer_strategy == 'auto':
+            print(
+                "Training without validation: checkpointing by train_loss. "
+                "No val_accuracy/val_NED metrics will be logged.",
+                flush=True,
+            )
+    else:
+        # Select checkpoints by validation NED instead of exact-match accuracy. (dawud 2026-05-19)
+        checkpoint = ModelCheckpoint(
+            monitor='val_NED',
+            mode='max',
+            save_top_k=3,
+            save_last=True,
+            filename='{epoch}-{step}-{val_accuracy:.4f}-{val_NED:.4f}',
+        )
+    # checkpoint = ModelCheckpoint(
+    #     monitor='val_accuracy',
+    #     mode='max',
+    #     save_top_k=3,
+    #     save_last=True,
+    #     filename='{epoch}-{step}-{val_accuracy:.4f}-{val_NED:.4f}',
+    # )
 
+
+    # SWA / Stochastic Weight Averaging note:
+    #
+    # SWA can be useful because it averages model weights from the late part of training.
+    # On many larger or more stable datasets, that averaging can land the model in a smoother
+    # region of the loss surface and improve generalization compared with one noisy final
+    # checkpoint.
+    #
+    # For this small custom handwriting/PARSeq fine-tuning setup, SWA is disabled for now.
+    # The validation logs showed the model often reached its best recognition metrics before
+    # the SWA phase, then became noisier or worse after Lightning swapped OneCycleLR for SWALR.
+    # With a small validation set and charset-dependent output layers being trained from
+    # scratch, the averaged late weights can smooth away a good specialized checkpoint rather
+    # than improve it.
+    #
+    # To enable SWA, uncomment the three lines below, restore the import above, and
+    # change callbacks=[checkpoint] to callbacks=[checkpoint, swa].  (dawud, 2026-05-19)
+    #
     swa_epoch_start = 0.75
     swa_lr = config.model.lr * get_swa_lr_factor(config.model.warmup_pct, swa_epoch_start)
     swa = StochasticWeightAveraging(swa_lr, swa_epoch_start)
@@ -139,6 +196,9 @@ def main(config: DictConfig):
         strategy=trainer_strategy,
         enable_model_summary=False,
         callbacks=[checkpoint, swa],
+        # If SWA is disabled above, use this instead:
+        # callbacks=[checkpoint],
+        
     )
     trainer.fit(model, datamodule=datamodule, ckpt_path=config.ckpt_path)
 

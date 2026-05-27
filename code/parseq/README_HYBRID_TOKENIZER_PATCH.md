@@ -75,3 +75,17 @@ Example with `_` and `^` intentionally absent from `charset_train`:
 x_{2}        -> ['x', '_{', '2', '}']
 y^{(0 + 0)}  -> ['y', '^{', '(', '0', ' ', '+', ' ', '0', ')', '}']
 ```
+
+
+## 2026-05-26 full hybrid-data-path patch
+
+This patch includes the full set of files needed for hybrid LaTeX token training:
+
+- `strhub/data/latex_tokenizer.py`: longest-match hybrid tokens, including non-backslash tokens like `_{` and `^{`.
+- `strhub/data/dataset.py`: accepts optional label adapter and token-length function; hybrid max length is measured in tokenizer units.
+- `strhub/data/module.py`: when `tokenizer_type=latex_hybrid`, preserves raw LaTeX labels until `HybridLatexTokenizer` validates/tokenizes them. This prevents `\theta` from being stripped to `theta` before training.
+- `strhub/models/base.py`: keeps raw LaTeX predictions/labels for validation metrics instead of applying `CharsetAdapter`.
+- `configs/main.yaml`: passes `model.tokenizer_type` and `model.latex_tokens` into the data module.
+- `configs/charset/latex_hybrid.yaml`: keeps `latex_tokens` under `model` so Hydra passes them into both the model and data module.
+
+This patch also includes the train-without-validation convenience changes from the no-val patch, so it can be applied as one combined patch instead of applying hybrid and no-val patches separately.

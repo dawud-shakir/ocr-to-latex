@@ -65,6 +65,8 @@ class LmdbDataset(Dataset):
         normalize_unicode: bool = True,
         unlabelled: bool = False,
         transform: Optional[Callable] = None,
+        label_adapter: Optional[Callable[[str], str]] = None,
+        label_length: Optional[Callable[[str], int]] = None,
     ):
         self._env = None
         self.root = root
@@ -73,7 +75,13 @@ class LmdbDataset(Dataset):
         self.labels = []
         self.filtered_index_list = []
         self.num_samples = self._preprocess_labels(
-            charset, remove_whitespace, normalize_unicode, max_label_len, min_image_dim
+            charset,
+            remove_whitespace,
+            normalize_unicode,
+            max_label_len,
+            min_image_dim,
+            label_adapter=label_adapter,
+            label_length=label_length,
         )
 
     def __del__(self):
@@ -92,8 +100,23 @@ class LmdbDataset(Dataset):
             self._env = self._create_env()
         return self._env
 
-    def _preprocess_labels(self, charset, remove_whitespace, normalize_unicode, max_label_len, min_image_dim):
-        charset_adapter = CharsetAdapter(charset)
+    def _preprocess_labels(
+        self,
+        charset,
+        remove_whitespace,
+        normalize_unicode,
+        max_label_len,
+        min_image_dim,
+        *,
+        label_adapter: Optional[Callable[[str], str]] = None,
+        label_length: Optional[Callable[[str], int]] = None,
+    ):
+        # Default PARSeq behavior: adapt raw labels with a character-level
+        # CharsetAdapter. Hybrid LaTeX training passes its own adapter/length
+        # function so labels such as r"\theta" and r"x_{2}" are validated by
+        # the tokenizer instead of being character-stripped before tokenization.
+        charset_adapter = label_adapter or CharsetAdapter(charset)
+        length_fn = label_length or len
         with self._create_env() as env, env.begin() as txn:
             num_samples = int(txn.get('num-samples'.encode()))
             if self.unlabelled:
@@ -108,19 +131,26 @@ class LmdbDataset(Dataset):
                 # Normalize unicode composites (if any) and convert to compatible ASCII characters
                 if normalize_unicode:
                     label = unicodedata.normalize('NFKD', label).encode('ascii', 'ignore').decode()
-                # Filter by length before removing unsupported characters. The original label might be too long.
-                if len(label) > max_label_len:
+                try:
+                    label = charset_adapter(label)
+                    label_len = length_fn(label)
+                except Exception as exc:
+                    log.debug('Skipping label %r from %s: %s', label, self.root, exc)
                     continue
-                label = charset_adapter(label)
-                # We filter out samples which don't contain any supported characters
+                # We filter out samples which don't contain any supported tokens/characters.
                 if not label:
+                    continue
+                # For hybrid tokenizers, max_label_len is measured in tokenizer
+                # units, not raw Python characters. Example: r"\theta" has raw
+                # length 6 but hybrid-token length 1.
+                if label_len > max_label_len:
                     continue
                 # Filter images that are too small.
                 if min_image_dim > 0:
                     img_key = f'image-{index:09d}'.encode()
                     buf = io.BytesIO(txn.get(img_key))
                     w, h = Image.open(buf).size
-                    if w < self.min_image_dim or h < self.min_image_dim:
+                    if w < min_image_dim or h < min_image_dim:
                         continue
                 self.labels.append(label)
                 self.filtered_index_list.append(index)

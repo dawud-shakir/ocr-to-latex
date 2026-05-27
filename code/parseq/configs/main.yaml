@@ -24,11 +24,14 @@ data:
   img_size: ${model.img_size}
   charset_train: ${model.charset_train}
   charset_test: ${model.charset_test}
+  tokenizer_type: ${model.tokenizer_type}
+  latex_tokens: ${model.latex_tokens}
   max_label_length: ${model.max_label_length}
   remove_whitespace: true
   normalize_unicode: true
   augment: true
   num_workers: 2
+  allow_missing_val: ${train_without_val}
 
 trainer:
   _target_: pytorch_lightning.Trainer
@@ -39,6 +42,10 @@ trainer:
   gradient_clip_val: 20
   accelerator: gpu
   devices: 2
+
+# Set true to allow a train-only run when root_dir/val is intentionally absent.
+# When true, train.py disables validation and checkpoints by train_loss instead of val_NED.
+train_without_val: false
 
 ckpt_path: null
 pretrained: null
