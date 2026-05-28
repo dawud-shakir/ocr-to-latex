@@ -15,7 +15,7 @@ configs/model/parseq.yaml
 configs/charset/latex_hybrid.yaml
 ```
 
-The copied `train.py`, `strhub/data/utils.py`, `configs/experiment/parseq-tiny.yaml`, and `configs/charset/94_full.yaml` are included only for context and are unchanged.
+The copied `train.py`, `strhub/data/utils.py`, `configs/experiment/parseq-tiny.yaml`, and `configs/charset/94_full.yaml` include the tokenizer-aware pretrained transfer and train-without-validation support used by this patch.
 
 ## Default behavior
 
@@ -60,7 +60,21 @@ becomes:
 
 ## Pretrained loading
 
-Your current `train.py` already loads only shape-compatible pretrained tensors. That is important because hybrid tokenization changes the output vocabulary size, so token-specific layers such as `head` and `text_embed` will be reinitialized while compatible encoder/decoder weights are reused.
+`train.py` uses token-aware pretrained transfer for vocabulary-dependent tensors:
+
+```text
+head.weight
+head.bias
+text_embed.embedding.weight
+```
+
+Matching tokens are copied by token string instead of raw row index. New multi-character hybrid tokens can optionally be initialized from the average of their spelling-piece rows when those characters exist in the pretrained charset.
+
+`train.py` also partially transfers PARSeq `pos_queries` when only `model.max_label_length` changes. Public PARSeq checkpoints usually have 26 position queries because they were trained with `max_label_length=25` plus EOS. If you train with a longer value such as `model.max_label_length=32`, the first 26 positions are copied and only the extra positions stay randomly initialized. This is controlled by:
+
+```yaml
+pretrained_transfer_pos_queries_prefix: true
+```
 
 ## 2026-05-25 tokenizer update
 

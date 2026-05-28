@@ -5,13 +5,14 @@
 # Example: r"\\theta" is one token, and x_{2} tokenizes as [x] [_{] [2] [}].
 model:
   tokenizer_type: latex_hybrid
-  charset_train: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ "
+  charset_train: "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~ " # includes a whitespace
   charset_test: ${model.charset_train}
   latex_tokens:
     # structural:
     - "_{"
     - "^{"
     - "}{"
+    - "{}"
 
     # group-opening commands:
     - "\\frac{"

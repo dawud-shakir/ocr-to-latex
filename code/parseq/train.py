@@ -23,9 +23,10 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 import torch
 
 from pytorch_lightning import Trainer
-# SWA is intentionally not imported by default for this custom handwriting fine-tuning script.
-# To disable SWA, comment this import:
-from pytorch_lightning.callbacks import ModelCheckpoint, StochasticWeightAveraging
+
+# To enable SWA, uncomment this import:
+# from pytorch_lightning.callbacks import StochasticWeightAveraging
+from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.utilities.model_summary import summarize
@@ -58,6 +59,45 @@ VOCAB_DEPENDENT_KEYS = {
     'head.bias',
     'text_embed.embedding.weight',
 }
+
+
+def _copy_pos_queries_prefix(
+    pretrained_tensor: torch.Tensor,
+    current_tensor: torch.Tensor,
+) -> tuple[torch.Tensor | None, int, int, int]:
+    """Partially copy learned PARSeq output-position queries.
+
+    Public PARSeq checkpoints use max_label_length=25, so their pos_queries
+    tensor normally has 26 positions: 25 label positions plus EOS. When fine-
+    tuning with a longer or shorter max_label_length, the only expected shape
+    change is the sequence-position dimension. Copy the shared prefix and keep
+    any extra destination positions at their normal random initialization.
+
+    Return (patched_tensor, copied_positions, source_positions, dest_positions).
+    patched_tensor is None when the tensors are incompatible, e.g. different
+    embedding dimensions from mixing parseq-tiny weights with parseq config.
+    """
+    if pretrained_tensor.ndim < 2 or current_tensor.ndim < 2:
+        return None, 0, 0, 0
+    if pretrained_tensor.ndim != current_tensor.ndim:
+        return None, 0, int(pretrained_tensor.shape[1]), int(current_tensor.shape[1])
+
+    # pos_queries is [1, max_label_length + 1, embed_dim] in PARSeq. Keep this
+    # generic over leading/trailing dimensions, but only allow dim=1 to differ.
+    if pretrained_tensor.shape[0] != current_tensor.shape[0]:
+        return None, 0, int(pretrained_tensor.shape[1]), int(current_tensor.shape[1])
+    if pretrained_tensor.shape[2:] != current_tensor.shape[2:]:
+        return None, 0, int(pretrained_tensor.shape[1]), int(current_tensor.shape[1])
+
+    src_positions = int(pretrained_tensor.shape[1])
+    dst_positions = int(current_tensor.shape[1])
+    copy_positions = min(src_positions, dst_positions)
+    if copy_positions <= 0:
+        return None, 0, src_positions, dst_positions
+
+    out = current_tensor.clone()
+    out[:, :copy_positions, ...].copy_(pretrained_tensor[:, :copy_positions, ...])
+    return out, copy_positions, src_positions, dst_positions
 
 
 def _get_cfg_value(config: DictConfig, key: str, default=None):
@@ -201,6 +241,7 @@ def _load_pretrained_token_aware(model: BaseSystem, inner_model: torch.nn.Module
 
     transfer_vocab_by_token = bool(_get_cfg_value(config, 'pretrained_transfer_vocab_by_token', True))
     init_new_from_spelling = bool(_get_cfg_value(config, 'pretrained_init_new_tokens_from_spelling', True))
+    transfer_pos_queries_prefix = bool(_get_cfg_value(config, 'pretrained_transfer_pos_queries_prefix', True))
 
     dest_tokenizer = getattr(model, 'tokenizer', None)
     source_tokenizer = None
@@ -218,6 +259,7 @@ def _load_pretrained_token_aware(model: BaseSystem, inner_model: torch.nn.Module
     loadable: dict[str, torch.Tensor] = {}
     skipped: list[str] = []
     row_transfer_report: list[str] = []
+    pos_query_transfer_report: list[str] = []
 
     for key, pretrained_tensor in pretrained.items():
         if key not in current:
@@ -244,12 +286,31 @@ def _load_pretrained_token_aware(model: BaseSystem, inner_model: torch.nn.Module
 
         if pretrained_tensor.shape == current_tensor.shape:
             loadable[key] = pretrained_tensor
+        elif key == 'pos_queries' and transfer_pos_queries_prefix:
+            patched, copied_positions, src_positions, dst_positions = _copy_pos_queries_prefix(
+                pretrained_tensor,
+                current_tensor,
+            )
+            if patched is not None:
+                loadable[key] = patched
+                pos_query_transfer_report.append(
+                    f"pos_queries: copied_prefix_positions={copied_positions}, "
+                    f"source_positions={src_positions}, dest_positions={dst_positions}, "
+                    f"left_random={max(dst_positions - copied_positions, 0)}"
+                )
+            else:
+                skipped.append(key)
         else:
             skipped.append(key)
 
     if row_transfer_report:
         print("Token-aware vocab row transfer:", flush=True)
         for line in row_transfer_report:
+            print("  " + line, flush=True)
+
+    if pos_query_transfer_report:
+        print("Partial pos_queries transfer:", flush=True)
+        for line in pos_query_transfer_report:
             print("  " + line, flush=True)
 
     if skipped:
@@ -339,35 +400,20 @@ def main(config: DictConfig):
             save_last=True,
             filename='{epoch}-{step}-{val_accuracy:.4f}-{val_NED:.4f}',
         )
-    # checkpoint = ModelCheckpoint(
-    #     monitor='val_accuracy',
-    #     mode='max',
-    #     save_top_k=3,
-    #     save_last=True,
-    #     filename='{epoch}-{step}-{val_accuracy:.4f}-{val_NED:.4f}',
-    # )
+        # checkpoint = ModelCheckpoint(
+        #     monitor='val_accuracy',
+        #     mode='max',
+        #     save_top_k=3,
+        #     save_last=True,
+        #     filename='{epoch}-{step}-{val_accuracy:.4f}-{val_NED:.4f}',
+        # )
 
-
-    # SWA / Stochastic Weight Averaging note:
-    #
-    # SWA can be useful because it averages model weights from the late part of training.
-    # On many larger or more stable datasets, that averaging can land the model in a smoother
-    # region of the loss surface and improve generalization compared with one noisy final
-    # checkpoint.
-    #
-    # For this small custom handwriting/PARSeq fine-tuning setup, SWA is disabled for now.
-    # The validation logs showed the model often reached its best recognition metrics before
-    # the SWA phase, then became noisier or worse after Lightning swapped OneCycleLR for SWALR.
-    # With a small validation set and charset-dependent output layers being trained from
-    # scratch, the averaged late weights can smooth away a good specialized checkpoint rather
-    # than improve it.
-    #
     # To enable SWA, uncomment the three lines below, restore the import above, and
     # change callbacks=[checkpoint] to callbacks=[checkpoint, swa].  (dawud, 2026-05-19)
     #
-    swa_epoch_start = 0.75
-    swa_lr = config.model.lr * get_swa_lr_factor(config.model.warmup_pct, swa_epoch_start)
-    swa = StochasticWeightAveraging(swa_lr, swa_epoch_start)
+    # swa_epoch_start = 0.75
+    # swa_lr = config.model.lr * get_swa_lr_factor(config.model.warmup_pct, swa_epoch_start)
+    # swa = StochasticWeightAveraging(swa_lr, swa_epoch_start)
     cwd = (
         HydraConfig.get().runtime.output_dir
         if config.ckpt_path is None
@@ -378,9 +424,9 @@ def main(config: DictConfig):
         logger=TensorBoardLogger(cwd, '', '.'),
         strategy=trainer_strategy,
         enable_model_summary=False,
-        callbacks=[checkpoint, swa],
-        # If SWA is disabled above, use this instead:
-        # callbacks=[checkpoint],
+        callbacks=[checkpoint],
+        # If SWA is enabled above, use this instead:
+        # callbacks=[checkpoint, swa],
         
     )
     trainer.fit(model, datamodule=datamodule, ckpt_path=config.ckpt_path)

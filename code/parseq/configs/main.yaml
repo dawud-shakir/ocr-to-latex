@@ -57,6 +57,9 @@ pretrained_charset: 94_full
 pretrained_charset_train: null
 pretrained_transfer_vocab_by_token: true
 pretrained_init_new_tokens_from_spelling: true
+# If model.max_label_length changes, copy the shared prefix of PARSeq's learned
+# output-position queries instead of skipping the entire pos_queries tensor.
+pretrained_transfer_pos_queries_prefix: true
 
 hydra:
   output_subdir: config
